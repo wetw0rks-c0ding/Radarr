@@ -11,14 +11,18 @@ using System.Threading.Tasks;
 using Diacritical;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.IdentityModel.Tokens;
 using Microsoft.Net.Http.Headers;
 using NLog;
 using NzbDrone.Common.Extensions;
 using NzbDrone.Common.Http.Dispatchers;
 using NzbDrone.Core.Authentication;
 using NzbDrone.Core.Configuration;
+using NzbDrone.Http.Authentication;
 
 namespace Radarr.Http.Authentication
 {
@@ -37,7 +41,24 @@ namespace Radarr.Http.Authentication
 
         public static AuthenticationBuilder AddAppAuthentication(this IServiceCollection services)
         {
-            return services.AddAuthentication(options =>
+            services.AddSingleton<IRadarrServiceTokenService, RadarrServiceTokenService>();
+            services.AddSingleton<IAuthentikTokenValidationService, AuthentikTokenValidationService>();
+            services.AddSingleton<IAuthorizationHandler, PermissionAuthorizationHandler>();
+
+            services.AddAuthorization(options =>
+            {
+                options.AddPolicy("UI.Read", policy => policy.Requirements.Add(new PermissionRequirement(RadarrRole.ReadOnly)));
+                options.AddPolicy("UI.Add", policy => policy.Requirements.Add(new PermissionRequirement(RadarrRole.AddSearch)));
+                options.AddPolicy("UI.Manage", policy => policy.Requirements.Add(new PermissionRequirement(RadarrRole.Manage)));
+                options.AddPolicy("UI.Admin", policy => policy.Requirements.Add(new PermissionRequirement(RadarrRole.Admin)));
+                options.AddPolicy("UI", policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.Requirements.Add(new BypassableDenyAnonymousAuthorizationRequirement());
+                });
+            });
+
+            var builder = services.AddAuthentication(options =>
                 {
                     options.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
                 })
@@ -55,6 +76,69 @@ namespace Radarr.Http.Authentication
                     options.HeaderName = "X-Api-Key";
                     options.QueryName = "access_token";
                 });
+
+            services.AddOptions<JwtBearerOptions>("Bearer")
+                .Configure<IRadarrServiceTokenService>((options, tokenService) =>
+                {
+                    if (tokenService == null || tokenService.SigningKey == null)
+                    {
+                        return;
+                    }
+
+                    options.TokenValidationParameters = new TokenValidationParameters
+                    {
+                        ValidateIssuer = true,
+                        ValidIssuer = "radarr",
+                        ValidateAudience = true,
+                        ValidAudience = "radarr",
+                        ValidateLifetime = true,
+                        ClockSkew = TimeSpan.FromMinutes(2),
+                        IssuerSigningKey = tokenService.SigningKey,
+                        NameClaimType = "sub",
+                        RoleClaimType = "role"
+                    };
+
+                    options.Events = new JwtBearerEvents
+                    {
+                        OnTokenValidated = context =>
+                        {
+                            var principal = context.Principal;
+                            if (principal == null)
+                            {
+                                return Task.CompletedTask;
+                            }
+
+                            var identity = principal.Identity as ClaimsIdentity;
+                            if (identity == null)
+                            {
+                                identity = new ClaimsIdentity(principal.Claims, "Bearer");
+                                context.Principal = new ClaimsPrincipal(identity);
+                            }
+
+                            if (principal.FindFirst("oidc_sub") == null)
+                            {
+                                var subClaim = principal.FindFirst("sub") ?? principal.FindFirst(ClaimTypes.NameIdentifier);
+                                if (subClaim != null)
+                                {
+                                    identity.AddClaim(new Claim("oidc_sub", subClaim.Value));
+                                }
+                            }
+
+                            if (principal.FindFirst("radarr_role") == null)
+                            {
+                                var roleClaim = principal.FindFirst("role") ?? principal.FindFirst(ClaimTypes.Role);
+                                if (roleClaim != null)
+                                {
+                                    identity.AddClaim(new Claim("radarr_role", roleClaim.Value));
+                                }
+                            }
+
+                            return Task.CompletedTask;
+                        }
+                    };
+                });
+
+            return builder.AddJwtBearer("Bearer", options => { });
         }
 
         private static AuthenticationBuilder AddApiKey(this AuthenticationBuilder authenticationBuilder, string name, Action<ApiKeyAuthenticationOptions> options)
@@ -89,20 +173,31 @@ namespace Radarr.Http.Authentication
                     options.ExpireTimeSpan = TimeSpan.FromDays(7);
                     options.SlidingExpiration = true;
                     options.Cookie.IsEssential = true;
-                    options.Events.OnValidatePrincipal = context =>
+                    options.Events.OnValidatePrincipal = async context =>
                     {
                         var configuredUser = configFileProvider.OidcUserIdentifier;
 
-                        if (configFileProvider.EffectiveAuthenticationMethod() == AuthenticationType.Oidc &&
-                            configuredUser.IsNotNullOrWhiteSpace() &&
-                            string.Equals(context.Principal?.FindFirst("user")?.Value, configuredUser, StringComparison.OrdinalIgnoreCase))
+                        if (configFileProvider.EffectiveAuthenticationMethod() == AuthenticationType.Oidc)
                         {
-                            return Task.CompletedTask;
+                            if (context.Principal?.FindFirst("oidc_sub") != null)
+                            {
+                                return;
+                            }
+
+                            if (configuredUser.IsNotNullOrWhiteSpace() &&
+                                string.Equals(context.Principal?.FindFirst("user")?.Value, configuredUser, StringComparison.OrdinalIgnoreCase))
+                            {
+                                return;
+                            }
+                        }
+                        else if (configuredUser.IsNotNullOrWhiteSpace() &&
+                                 string.Equals(context.Principal?.FindFirst("user")?.Value, configuredUser, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return;
                         }
 
                         context.RejectPrincipal();
-
-                        return context.HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+                        await context.HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
                     };
 
                     options.Events.OnRedirectToLogin = context => EventOnRedirectCookiesLogin(context, 401);
@@ -129,12 +224,18 @@ namespace Radarr.Http.Authentication
                     options.ClientSecret = configFileProvider.OidcClientSecret;
                     options.ResponseType = "code";
                     options.ResponseMode = "query";
+                    options.UsePkce = true;
                     options.BackchannelHttpHandler = GetBackchannelHttpHandler(certificateValidationService);
                     options.Scope.Clear();
 
                     foreach (var scope in AuthenticationConfigurationExtensions.GetOidcScopes(configFileProvider.OidcScopes).Distinct(StringComparer.Ordinal))
                     {
                         options.Scope.Add(scope);
+                    }
+
+                    if (!options.Scope.Contains("offline_access"))
+                    {
+                        options.Scope.Add("offline_access");
                     }
 
                     options.MapInboundClaims = false;
@@ -154,11 +255,14 @@ namespace Radarr.Http.Authentication
                             return Task.CompletedTask;
                         }
 
-                        if (!TryAuthorize(configFileProvider, context.Principal, null))
+                        if (!TryAuthorizeWithGroups(configFileProvider, context.Principal, null))
                         {
                             context.HandleResponse();
                             context.Response.Redirect(configFileProvider.UrlBase + "/login?ssoFailed=true");
+                            return Task.CompletedTask;
                         }
+
+                        context.Properties.Items[AuthorizedProperty] = "true";
 
                         return Task.CompletedTask;
                     };
@@ -189,7 +293,7 @@ namespace Radarr.Http.Authentication
                     // Custom event to validate only authorized users
                     options.Events.OnUserInformationReceived = context =>
                     {
-                        if (!TryAuthorize(configFileProvider, context.Principal, context.User.RootElement))
+                        if (!TryAuthorizeWithGroups(configFileProvider, context.Principal, context.User.RootElement))
                         {
                             context.Fail("User is not authorized to access this application");
 
@@ -238,6 +342,166 @@ namespace Radarr.Http.Authentication
                 });
 
             return authenticationBuilder.AddCookie(nameof(AuthenticationType.Forms));
+        }
+
+        private static bool TryAuthorizeWithGroups(IConfigFileProvider configFileProvider, ClaimsPrincipal principal, JsonElement? user)
+        {
+            var groupsClaimName = configFileProvider.OidcGroupsClaim ?? "groups";
+            var groups = new List<string>();
+
+            if (user.HasValue)
+            {
+                if (TryGetProperty(user.Value, groupsClaimName, out var groupsElement))
+                {
+                    ExtractGroups(groupsElement, groups);
+                }
+            }
+
+            if (groups.Count == 0 && principal != null)
+            {
+                var claim = principal.FindFirst(groupsClaimName) ?? principal.FindFirst("groups") ?? principal.FindFirst("memberOf");
+                if (claim != null && !string.IsNullOrWhiteSpace(claim.Value))
+                {
+                    var value = claim.Value;
+                    if (value.Trim().StartsWith('['))
+                    {
+                        try
+                        {
+                            var parsed = JsonSerializer.Deserialize<List<string>>(value);
+                            if (parsed != null)
+                            {
+                                groups.AddRange(parsed.Where(g => !string.IsNullOrWhiteSpace(g)));
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                    else if (value.Contains(','))
+                    {
+                        groups.AddRange(value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                    }
+                    else
+                    {
+                        groups.Add(value.Trim());
+                    }
+                }
+            }
+
+            var role = OidcGroupMapping.Resolve(groups);
+            if (role != null)
+            {
+                var claims = new List<Claim>
+                {
+                    new("AuthenticationType", nameof(AuthenticationType.Oidc)),
+                    new("Provider", "OIDC"),
+                    new("radarr_role", role.Value.ToString()),
+                    new("oidc_sub", GetClaimValue(principal, user, "sub") ?? string.Empty)
+                };
+
+                if (!string.IsNullOrWhiteSpace(groupsClaimName))
+                {
+                    claims.Add(new Claim("oidc_groups", string.Join(",", groups)));
+                }
+
+                principal?.AddIdentity(new ClaimsIdentity(claims));
+
+                return true;
+            }
+
+            var configuredUser = configFileProvider.OidcUserIdentifier;
+
+            if (configuredUser.IsNullOrWhiteSpace())
+            {
+                Logger.Error("No authorized users configured");
+                return false;
+            }
+
+            var identifiers = GetIdentifiers(principal, user);
+
+            if (!identifiers.Any(i => string.Equals(i, configuredUser, StringComparison.OrdinalIgnoreCase)))
+            {
+                Logger.Error("User '{0}' is not authorized to access this application", identifiers.FirstOrDefault() ?? "unknown");
+                return false;
+            }
+
+            var fallbackClaims = new List<Claim>
+            {
+                new("user", configuredUser),
+                new("AuthenticationType", nameof(AuthenticationType.Oidc)),
+                new("Provider", "OIDC"),
+                new("radarr_role", RadarrRole.Admin.ToString()),
+                new("oidc_sub", GetClaimValue(principal, user, "sub") ?? configuredUser)
+            };
+
+            principal?.AddIdentity(new ClaimsIdentity(fallbackClaims));
+
+            return true;
+        }
+
+        private static void ExtractGroups(JsonElement element, List<string> groups)
+        {
+            if (element.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in element.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String)
+                    {
+                        var value = item.GetString();
+                        if (!string.IsNullOrWhiteSpace(value))
+                        {
+                            groups.Add(value);
+                        }
+                    }
+                }
+
+                return;
+            }
+
+            if (element.ValueKind == JsonValueKind.String)
+            {
+                var value = element.GetString();
+                if (string.IsNullOrWhiteSpace(value))
+                {
+                    return;
+                }
+
+                if (value.Trim().StartsWith('['))
+                {
+                    try
+                    {
+                        var parsed = JsonSerializer.Deserialize<List<string>>(value);
+                        if (parsed != null)
+                        {
+                            groups.AddRange(parsed.Where(g => !string.IsNullOrWhiteSpace(g)));
+                        }
+                    }
+                    catch
+                    {
+                    }
+
+                    return;
+                }
+
+                if (value.Contains(','))
+                {
+                    groups.AddRange(value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                    return;
+                }
+
+                groups.Add(value.Trim());
+            }
+        }
+
+        private static bool TryGetProperty(JsonElement element, string propertyName, out JsonElement value)
+        {
+            if (element.ValueKind == JsonValueKind.Object && element.TryGetProperty(propertyName, out value))
+            {
+                return true;
+            }
+
+            value = default;
+            return false;
         }
 
         private static bool TryAuthorize(IConfigFileProvider configFileProvider, ClaimsPrincipal principal, JsonElement? user)

@@ -12,4 +12,5 @@ public class AuthOptions
     public string OidcClientSecret { get; set; }
     public string OidcUserIdentifier { get; set; }
     public string OidcScopes { get; set; }
+    public string OidcGroupsClaim { get; set; }
 }

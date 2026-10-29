@@ -16,6 +16,7 @@ namespace NzbDrone.Core.Authentication
         User Add(string username, string password);
         User Update(User user);
         User Upsert(string username, string password);
+        User UpsertOidcUser(string subject, string username, string groups, RadarrRole role);
         User FindUser();
         User FindUser(string username, string password);
         User FindUser(Guid identifier);
@@ -157,6 +158,51 @@ namespace NzbDrone.Core.Authentication
             var hashedPassword = GetHashedPassword(password, salt, user.Iterations);
 
             return user.Password == hashedPassword;
+        }
+
+        public User UpsertOidcUser(string subject, string username, string groups, RadarrRole role)
+        {
+            if (string.IsNullOrWhiteSpace(subject))
+            {
+                throw new ArgumentException("Subject is required", nameof(subject));
+            }
+
+            var existing = _repo.FindBySubject(subject);
+            if (existing != null)
+            {
+                var updated = existing;
+                if (!string.IsNullOrWhiteSpace(username))
+                {
+                    updated.Username = username.ToLowerInvariant();
+                }
+
+                updated.OidcGroups = groups;
+                updated.Role = role;
+                return _repo.Update(updated);
+            }
+
+            var normalizedUsername = string.IsNullOrWhiteSpace(username) ? subject.ToLowerInvariant() : username.ToLowerInvariant();
+
+            var newUser = new User
+            {
+                Identifier = Guid.NewGuid(),
+                Username = normalizedUsername,
+                Password = string.Empty,
+                Salt = string.Empty,
+                Iterations = 0,
+                OidcSubject = subject,
+                OidcGroups = groups,
+                Role = role
+            };
+
+            try
+            {
+                return _repo.Insert(newUser);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Failed to insert OIDC user (username may already exist): " + ex.Message, ex);
+            }
         }
 
         public void Handle(ApplicationStartedEvent message)

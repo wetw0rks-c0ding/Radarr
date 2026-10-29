@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
@@ -34,6 +36,164 @@ namespace Radarr.Http.Authentication
             _configFileProvider = configFileProvider;
             _appFolderInfo = appFolderInfo;
             _logger = logger;
+        }
+
+        private static readonly ConcurrentDictionary<string, Queue<DateTime>> ExchangeRateLimits = new(StringComparer.Ordinal);
+        private static readonly object ExchangeRateLock = new();
+
+        private static bool TryAcquireExchangeRateLimit(string clientIp)
+        {
+            var now = DateTime.UtcNow;
+            var window = TimeSpan.FromMinutes(1);
+
+            lock (ExchangeRateLock)
+            {
+                if (!ExchangeRateLimits.TryGetValue(clientIp, out var queue))
+                {
+                    queue = new Queue<DateTime>();
+                    ExchangeRateLimits[clientIp] = queue;
+                }
+
+                while (queue.Count > 0 && (now - queue.Peek()) > window)
+                {
+                    queue.Dequeue();
+                }
+
+                if (queue.Count >= 10)
+                {
+                    return false;
+                }
+
+                queue.Enqueue(now);
+                return true;
+            }
+        }
+
+        [HttpPost("api/auth/oidc/exchange")]
+        [AllowAnonymous]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(StatusCodes.Status429TooManyRequests)]
+        public async Task<IResult> ExchangeOidc([FromBody] OidcExchangeRequest request)
+        {
+            var httpContext = HttpContext ?? new DefaultHttpContext();
+
+            var clientIp = httpContext.Connection?.RemoteIpAddress?.ToString();
+            if (string.IsNullOrWhiteSpace(clientIp))
+            {
+                clientIp = "unknown";
+            }
+
+            if (!TryAcquireExchangeRateLimit(clientIp))
+            {
+                return TypedResults.Json(new { message = "rate_limit_exceeded" }, statusCode: StatusCodes.Status429TooManyRequests);
+            }
+
+            var subjectToken = request?.ResolvedSubjectToken;
+
+            if (string.IsNullOrWhiteSpace(subjectToken))
+            {
+                var authHeader = httpContext.Request.Headers.Authorization.ToString();
+                if (authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                {
+                    subjectToken = authHeader.Substring(7).Trim();
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(subjectToken))
+            {
+                return TypedResults.Json(new { message = "subject_token is required" }, statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var authentik = httpContext.RequestServices?.GetService(typeof(IAuthentikTokenValidationService)) as IAuthentikTokenValidationService;
+            if (authentik == null)
+            {
+                return TypedResults.Json(new { message = "service_unavailable" }, statusCode: StatusCodes.Status500InternalServerError);
+            }
+
+            var validation = await authentik.ValidateAsync(subjectToken);
+            if (!validation.Success)
+            {
+                return TypedResults.Json(new { message = "invalid_token" }, statusCode: StatusCodes.Status401Unauthorized);
+            }
+
+            var role = OidcGroupMapping.Resolve(validation.Groups);
+            if (role == null)
+            {
+                return TypedResults.Json(new { message = "insufficient_group" }, statusCode: StatusCodes.Status403Forbidden);
+            }
+
+            var userService = httpContext.RequestServices?.GetService(typeof(IUserService)) as IUserService;
+            try
+            {
+                userService?.UpsertOidcUser(validation.Subject, validation.Username, string.Join(",", validation.Groups), role.Value);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Failed to upsert OIDC user");
+                return TypedResults.Json(new { message = "User provisioning failed" }, statusCode: StatusCodes.Status500InternalServerError);
+            }
+
+            var tokenService = httpContext.RequestServices?.GetService(typeof(IRadarrServiceTokenService)) as IRadarrServiceTokenService;
+            var radarrToken = tokenService != null ? tokenService.MintToken(validation.Subject, role.Value) : null;
+
+            return TypedResults.Json(new
+            {
+                token = radarrToken,
+                token_type = "Bearer",
+                expires_in = 300,
+                role = role.Value.ToString(),
+                permissions = RadarrRolePermissions.ForRole(role.Value),
+            },
+            statusCode: StatusCodes.Status200OK);
+        }
+
+        [HttpGet("api/auth/me")]
+        [AllowAnonymous]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+        [ProducesResponseType(StatusCodes.Status404NotFound)]
+        public IResult GetMe()
+        {
+            var httpContext = HttpContext ?? new DefaultHttpContext();
+
+            var authHeader = httpContext.Request.Headers.Authorization.ToString();
+            string token = null;
+            if (authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            {
+                token = authHeader.Substring(7).Trim();
+            }
+
+            var tokenService = httpContext.RequestServices?.GetService(typeof(IRadarrServiceTokenService)) as IRadarrServiceTokenService;
+            var principal = tokenService != null ? tokenService.ValidateToken(token) : null;
+            if (principal == null)
+            {
+                return TypedResults.Json(new { message = "invalid_token" }, statusCode: StatusCodes.Status401Unauthorized);
+            }
+
+            var sub = principal.FindFirst("sub")?.Value;
+
+            var repo = httpContext.RequestServices?.GetService(typeof(IUserRepository)) as IUserRepository;
+            var user = repo != null && sub != null ? repo.FindBySubject(sub) : null;
+            if (user == null)
+            {
+                return TypedResults.Json(new { message = "not_found" }, statusCode: StatusCodes.Status404NotFound);
+            }
+
+            var groups = string.IsNullOrWhiteSpace(user.OidcGroups)
+                ? new List<string>()
+                : user.OidcGroups.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
+            return TypedResults.Json(new
+            {
+                username = user.Username,
+                role = user.Role.ToString(),
+                groups,
+                permissions = RadarrRolePermissions.ForRole(user.Role),
+            },
+            statusCode: StatusCodes.Status200OK);
         }
 
         [HttpGet("login/sso")]
@@ -163,5 +323,14 @@ namespace Radarr.Http.Authentication
 
             return urlBase + returnUrl;
         }
+    }
+
+    public class OidcExchangeRequest
+    {
+        public string Code { get; set; }
+        public string GrantType { get; set; }
+        public string SubjectToken { get; set; }
+        public string SubjectTokenType { get; set; }
+        public string ResolvedSubjectToken { get; set; }
     }
 }
