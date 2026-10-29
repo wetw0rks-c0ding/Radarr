@@ -80,7 +80,26 @@ namespace NzbDrone.Core.Authentication
 
         public User FindUser()
         {
-            return _repo.SingleOrDefault();
+            // Single-user assumption broke with OIDC: provisioned OIDC rows share
+            // the table with the legacy forms user. Settings endpoints only need
+            // the local (non-OIDC) user, so scope the lookup to OidcSubject == null.
+            var local = (_repo.All() ?? Enumerable.Empty<User>())
+                .Where(u => u.OidcSubject == null)
+                .SingleOrDefault();
+
+            if (local == null)
+            {
+                try
+                {
+                    local = _repo.FindLocalUser();
+                }
+                catch
+                {
+                    // Fall back to in-memory scan if the repository does not support FindLocalUser.
+                }
+            }
+
+            return local;
         }
 
         public User FindUser(string username, string password)
