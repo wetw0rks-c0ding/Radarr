@@ -267,6 +267,36 @@ namespace Radarr.Http.Authentication
                         return Task.CompletedTask;
                     };
 
+                    options.Events.OnRedirectToIdentityProvider = context =>
+                    {
+                        // Servarr sits behind TLS-terminating tailscale serve via a Docker
+                        // bridge peer, so HttpRequest.Scheme is http even though the user
+                        // arrived over https. Authentik would then send the browser back
+                        // to an http:// callback on a TLS-only port (connection reset).
+                        // Force https for non-loopback redirect URIs; loopback stays http
+                        // for native/PKCE flows. Both schemes are registered in Authentik.
+                        var redirectUri = context.ProtocolMessage?.RedirectUri;
+                        if (!string.IsNullOrWhiteSpace(redirectUri) &&
+                            redirectUri.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                var uri = new Uri(redirectUri);
+                                if (!uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) &&
+                                    !System.Net.IPAddress.TryParse(uri.Host, out _))
+                                {
+                                    context.ProtocolMessage.RedirectUri = "https://" + redirectUri.Substring(7);
+                                }
+                            }
+                            catch (UriFormatException ex)
+                            {
+                                Logger.Warn(ex, "Unable to parse OIDC redirect URI '{0}'", redirectUri);
+                            }
+                        }
+
+                        return Task.CompletedTask;
+                    };
+
                     options.Events.OnRedirectToIdentityProviderForSignOut = context =>
                     {
                         if (context.ProtocolMessage.IssuerAddress.IsNullOrWhiteSpace())
