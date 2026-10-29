@@ -22,11 +22,11 @@ namespace Radarr.Http.Authentication
 
     public class AuthentikTokenValidationService : IAuthentikTokenValidationService
     {
-        public const string FallbackIssuer = "https://auth.piracyhub.win/application/o/radarr/";
+        public const string FallbackIssuer = "https://auth.piracyhub.win/application/o/arrstack/";
 
         public const string Issuer = FallbackIssuer;
 
-        public const string RequiredAudienceSubstring = "radarr";
+        public const string RequiredAudienceSubstring = "arrstack";
 
         private static readonly Logger Logger = LogManager.GetLogger(nameof(AuthentikTokenValidationService));
 
@@ -133,8 +133,15 @@ namespace Radarr.Http.Authentication
                         ValidateAudience = true,
                         ValidAudience = expectedAudience,
                         AudienceValidator = expectedAudience != null
-                            ? (audiences, securityToken, validationParameters) => audiences != null && audiences.Any(a => string.Equals(a, expectedAudience, StringComparison.Ordinal))
-                            : (audiences, securityToken, validationParameters) => audiences != null && audiences.Any(audience => !string.IsNullOrWhiteSpace(audience) && audience.Contains(RequiredAudienceSubstring)),
+                            ? (audiences, securityToken, validationParameters) => audiences != null && audiences.Any(a => string.Equals(a, expectedAudience, StringComparison.Ordinal) ||
+                                                                                                                                 string.Equals(a, "arrstack", StringComparison.OrdinalIgnoreCase))
+                            : (audiences, securityToken, validationParameters) => audiences != null && audiences.Any(audience => !string.IsNullOrWhiteSpace(audience) &&
+                                                                                                                                 (audience.Contains("arrstack", StringComparison.OrdinalIgnoreCase) ||
+                                                                                                                                  audience.Contains(RequiredAudienceSubstring, StringComparison.OrdinalIgnoreCase) ||
+                                                                                                                                  audience.Contains("sonarr", StringComparison.OrdinalIgnoreCase) ||
+                                                                                                                                  audience.Contains("radarr", StringComparison.OrdinalIgnoreCase) ||
+                                                                                                                                  audience.Contains("lidarr", StringComparison.OrdinalIgnoreCase) ||
+                                                                                                                                  audience.Contains("prowlarr", StringComparison.OrdinalIgnoreCase))),
                         ValidateLifetime = true,
                         ClockSkew = TimeSpan.FromMinutes(2),
                         IssuerSigningKeys = signingKeys.Count > 0 ? signingKeys : null,
