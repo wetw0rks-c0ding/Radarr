@@ -50,7 +50,7 @@ namespace Radarr.Api.V3.Config
             SharedValidator.RuleFor(c => c.AllowedHosts)
                            .Must(h => AllowedHostsParser.Parse(h).Any())
                            .When(c => c.AuthenticationRequired != AuthenticationRequiredType.Enabled &&
-                                      c.AuthenticationMethod != AuthenticationType.Oidc)
+                                      c.AuthenticationMethod == AuthenticationType.Forms)
                            .WithMessage("Allowed Hosts is required when 'Authentication Required' is not 'Enabled'");
 
             SharedValidator.RuleFor(c => c.AllowedHosts)
