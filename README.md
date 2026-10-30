@@ -1,5 +1,7 @@
 # Radarr
 
+> **Fork note — OIDC build for Seekarr:** this fork adds Authentik OIDC group-based authorization and Seekarr mobile app-auth (`POST /api/auth/oidc/exchange`, `GET /api/auth/me`) on top of upstream. Group tiers: `pirates` blocked (403), `homies` ReadOnly, `family` AddSearch, `maintenance` Manage, `authentik Admins` Admin. Unified provider `https://auth.piracyhub.win/application/o/arrstack/` (per-service `.../o/radarr/` etc. also accepted). Branch: `develop` (fork). Prebuilt image: `ghcr.io/wetw0rks-c0ding/radarr-oidc:develop` (port 7878). Details in `docs/project-logs/`. These are fork-only patches, not intended for upstream.
+
 [![Build Status](https://dev.azure.com/Radarr/Radarr/_apis/build/status/Radarr.Radarr?branchName=develop)](https://dev.azure.com/Radarr/Radarr/_build/latest?definitionId=1&branchName=develop)
 [![Translation status](https://translate.servarr.com/widget/servarr/radarr/svg-badge.svg)](https://translate.servarr.com/engage/servarr/?utm_source=widget)
 [![Docker Pulls](https://img.shields.io/docker/pulls/linuxserver/radarr.svg)](https://wiki.servarr.com/radarr/installation/docker)
