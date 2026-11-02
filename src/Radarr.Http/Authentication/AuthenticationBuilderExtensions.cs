@@ -42,7 +42,7 @@ namespace Radarr.Http.Authentication
         public static AuthenticationBuilder AddAppAuthentication(this IServiceCollection services)
         {
             services.AddSingleton<IRadarrServiceTokenService, RadarrServiceTokenService>();
-            services.AddSingleton<IAuthentikTokenValidationService, AuthentikTokenValidationService>();
+            services.AddSingleton<IOidcTokenValidationService, OidcTokenValidationService>();
             services.AddSingleton<IAuthorizationHandler, PermissionAuthorizationHandler>();
 
             services.AddAuthorization(options =>
@@ -285,7 +285,7 @@ namespace Radarr.Http.Authentication
                                 if (!uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) &&
                                     !System.Net.IPAddress.TryParse(uri.Host, out _))
                                 {
-                                    context.ProtocolMessage.RedirectUri = "https://" + redirectUri.Substring(7);
+                                    context.ProtocolMessage.RedirectUri = "https://" + redirectUri.AsSpan(7).ToString();
                                 }
                             }
                             catch (UriFormatException ex)
@@ -374,6 +374,31 @@ namespace Radarr.Http.Authentication
             return authenticationBuilder.AddCookie(nameof(AuthenticationType.Forms));
         }
 
+        public static IEnumerable<string> GetGroups(ClaimsPrincipal principal, string claimName)
+        {
+            var groups = new List<string>();
+
+            if (principal == null || string.IsNullOrWhiteSpace(claimName))
+            {
+                return groups;
+            }
+
+            foreach (var claim in principal.FindAll(claimName))
+            {
+                if (string.IsNullOrWhiteSpace(claim.Value))
+                {
+                    continue;
+                }
+
+                foreach (var part in claim.Value.Split(new[] { ',', ';', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    groups.Add(part);
+                }
+            }
+
+            return groups.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
         private static bool TryAuthorizeWithGroups(IConfigFileProvider configFileProvider, ClaimsPrincipal principal, JsonElement? user)
         {
             var groupsClaimName = configFileProvider.OidcGroupsClaim ?? "groups";
@@ -418,7 +443,7 @@ namespace Radarr.Http.Authentication
                 }
             }
 
-            var role = OidcGroupMapping.Resolve(groups);
+            var role = OidcGroupMapping.Resolve(groups, configFileProvider.OidcRoleMappings);
             if (role != null)
             {
                 var claims = new List<Claim>

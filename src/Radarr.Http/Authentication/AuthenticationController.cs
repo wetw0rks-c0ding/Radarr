@@ -107,7 +107,7 @@ namespace Radarr.Http.Authentication
                 return TypedResults.Json(new { message = "subject_token is required" }, statusCode: StatusCodes.Status400BadRequest);
             }
 
-            var authentik = httpContext.RequestServices?.GetService(typeof(IAuthentikTokenValidationService)) as IAuthentikTokenValidationService;
+            var authentik = httpContext.RequestServices?.GetService(typeof(IOidcTokenValidationService)) as IOidcTokenValidationService;
             if (authentik == null)
             {
                 return TypedResults.Json(new { message = "service_unavailable" }, statusCode: StatusCodes.Status500InternalServerError);
@@ -119,7 +119,7 @@ namespace Radarr.Http.Authentication
                 return TypedResults.Json(new { message = "invalid_token" }, statusCode: StatusCodes.Status401Unauthorized);
             }
 
-            var role = OidcGroupMapping.Resolve(validation.Groups);
+            var role = OidcGroupMapping.Resolve(validation.Groups, _configFileProvider.OidcRoleMappings);
             if (role == null)
             {
                 return TypedResults.Json(new { message = "insufficient_group" }, statusCode: StatusCodes.Status403Forbidden);
