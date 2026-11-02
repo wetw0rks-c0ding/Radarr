@@ -30,11 +30,12 @@ Goal: make the OIDC stack provider-neutral so any standards-compliant IdP works,
 - Audience rule: if `OidcClientId` set → exact match only (drop the `arrstack` carve-out). If unset → fail closed, no validation attempted.
 - Lazy-init the `ConfigurationManager` on first `ValidateAsync` (currently constructed with a dummy URL when unconfigured).
 
-### 3) Fixtures + tests
-- Rename `*AuthentikTokenValidationService*Fixture` → `*OidcTokenValidationService*Fixture`; replace hardcoded `arrstack` issuer/aud strings with values from test config (`OidcAuthority`/`OidcClientId`).
-- Replace `OidcGroupMappingFixture` hardcoded groups with mapping-driven cases: exact match, case-insensitivity, highest-wins, unmapped → null, empty mapping → null, malformed pair ignored.
-- `AuthenticationControllerOidcFixture` (`/exchange`, `/me`): unchanged behavior, updated service names.
-- `UpsertOidcUserFixture`: unchanged.
+### 3) Fixtures + tests (Radarr: create from scratch)
+Radarr has no OIDC test fixtures today (no `*Authentik*Fixture`, `OidcGroupMappingFixture`, `AuthenticationControllerOidcFixture`, or `UpsertOidcUserFixture` in any `*.Test` project), so this step creates rather than renames:
+- New validation-service fixture for the renamed `OidcTokenValidationService`: exact-match audience accept/reject driven by test `OidcAuthority`/`OidcClientId` values (no hardcoded `arrstack` strings).
+- New mapping-resolver fixture: exact match, case-insensitivity, highest-wins across `RadarrRole`, unmapped → null, empty mapping → null, malformed pair ignored.
+- New `/exchange` + `/me` controller fixture: unchanged behavior from §1 contract, updated service names.
+- `UpsertOidcUser` coverage for subject-first provisioning (no username auto-link).
 
 ### 4) Migration / rollout
 - No DB migration (config-file/env only).
